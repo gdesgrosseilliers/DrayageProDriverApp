@@ -1,2 +1,826 @@
 import React, { useEffect, useRef, useState } from 'react'
-// ... (The complete Drayage Pro Driver App code is included here)
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
+import { Badge } from '@/components/ui/badge'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
+import { Label } from '@/components/ui/label'
+import { Check, ClipboardList, CloudUpload, FileText, Filter, Loader2, LogIn, MapPin, MessageCircle, Search, ShieldCheck, Truck, UploadCloud, User, WifiOff } from 'lucide-react'
+
+// -------------------- TYPES --------------------
+export type Load = {
+  id: string
+  ref: string
+  origin: string
+  destination: string
+  pickup: string
+  delivery: string
+  commodity?: string
+  distanceMi?: number
+  equipment: 'CHASSIS'|'DRY'|'REEFER'|'FLAT'|'TANK'|'OTHER'
+  rate?: number
+  accessorials?: string[]
+  notes?: string
+  postedToNetwork?: boolean
+  thirdPartyRef?: string
+  referenceNumbers?: string[]
+}
+export type Bid = { id:string; loadId:string; amount:number; status:'PENDING'|'COUNTER'|'ACCEPTED'|'REJECTED'; createdAt:string; notes?:string }
+export type Driver = { id:string; name:string; mc?:string; dot?:string; phone?:string; email?:string; isAdmin?:boolean }
+export type DriverLoad = Load & { status:'TENDERED'|'ASSIGNED'|'EN_ROUTE'|'AT_SHIPPER'|'PICKED_UP'|'AT_CONSIGNEE'|'DELIVERED'; podSubmitted?:boolean }
+export type ComplianceItem = { id:string; type:'W9'|'COI'|'CDL'|'MC_AUTH'|'DOT_LETTER'|'CARGO_INSURANCE'|'AUTO_INSURANCE'|'CARRIER_AGREEMENT'|'OTHER'; status:'APPROVED'|'PENDING'|'EXPIRED'|'REJECTED'; expiry?:string; fileUrl?:string }
+export type Msg = { id:string; from:string; subject:string; body:string; ts:string }
+export type AuthorityInfo = { status:'ACTIVE'|'INACTIVE'|'OUT_OF_SERVICE'|'NOT_FOUND'; operatingStatus?:string; legalName?:string; dbaName?:string; mcNumber?:string; dotNumber?:string; entityType?:string; authorityType?:string; insuranceOnFile?:boolean; boc3OnFile?:boolean; outOfServiceDate?:string|null; lastUpdated?:string; saferUrl?:string }
+export type UserRow = { id:string; username:string; role:'admin'|'driver'|'carrier' } & Partial<Pick<Driver,'email'|'phone'|'name'>>
+
+// -------------------- CONFIG --------------------
+const USE_MOCK = true
+const BASE_URL = 'https://api.drayagepro.example'
+
+// -------------------- UTILS --------------------
+const fmt = {
+  dt: (iso?: string) => (iso ? new Date(iso).toLocaleString() : '—'),
+  d:  (iso?: string) => (iso ? new Date(iso).toLocaleDateString() : '—'),
+  money: (n?: number) => (n == null ? '—' : `$${n.toLocaleString(undefined, { maximumFractionDigits: 0 })}`),
+}
+const storage = {
+  set<T>(k:string,v:T){ localStorage.setItem(k, JSON.stringify(v)) },
+  get<T>(k:string,f:T):T{ try{ const v=localStorage.getItem(k); return v? JSON.parse(v) as T:f }catch{ return f }},
+  del(k:string){ localStorage.removeItem(k) }
+}
+function SA({children}:{children:React.ReactNode}){
+  return (
+    <div style={{
+      paddingTop:'env(safe-area-inset-top)',
+      paddingBottom:'env(safe-area-inset-bottom)',
+      paddingLeft:'env(safe-area-inset-left)',
+      paddingRight:'env(safe-area-inset-right)'
+    }}>{children}</div>
+  )
+}
+function useOnlineStatus(){
+  const [o,set]=useState(typeof navigator==='undefined'?true:navigator.onLine)
+  useEffect(()=>{ const on=()=>set(navigator.onLine); window.addEventListener('online',on); window.addEventListener('offline',on); return()=>{ window.removeEventListener('online',on); window.removeEventListener('offline',on) } },[])
+  return o
+}
+
+// -------------------- OFFLINE QUEUE --------------------
+type QueuedKind = 'POD'|'COMPLIANCE'|'SYNC'
+type SerializedFile = { name:string; type:string; data:ArrayBuffer }
+type SerializedFormData = Array<{ key:string; value:string|SerializedFile }>
+type QueueItem = { id:string; kind:QueuedKind; url:string; method:'POST'; contentType:'form'|'json'; form?:SerializedFormData; json?:any; headers?:Record<string,string>; createdAt:number; attempts:number }
+
+const idbq = (():{ put:(i:QueueItem)=>Promise<void>; all:()=>Promise<QueueItem[]>; del:(id:string)=>Promise<void> }=>{
+  let p:Promise<IDBDatabase>|null=null
+  const DB='drp-queue', STORE='pending'
+  function open(){
+    if(p) return p
+    p = new Promise((res,rej)=>{
+      const r = indexedDB.open(DB,1)
+      r.onupgradeneeded = ()=>{ r.result.createObjectStore(STORE,{keyPath:'id'}) }
+      r.onsuccess = ()=> res(r.result)
+      r.onerror = ()=> rej(r.error)
+    })
+    return p
+  }
+  async function put(i:QueueItem){ const db=await open(); return new Promise<void>((res,rej)=>{ const tx=db.transaction(STORE,'readwrite'); tx.objectStore(STORE).put(i); tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error as any) }) }
+  async function all(){ const db=await open(); return new Promise<QueueItem[]>((res,rej)=>{ const tx=db.transaction(STORE,'readonly'); const r=tx.objectStore(STORE).getAll(); r.onsuccess=()=>res(r.result as QueueItem[]); r.onerror=()=>rej(r.error as any) }) }
+  async function del(id:string){ const db=await open(); return new Promise<void>((res,rej)=>{ const tx=db.transaction(STORE,'readwrite'); tx.objectStore(STORE).delete(id); tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error as any) }) }
+  return { put, all, del }
+})()
+
+async function serializeFormData(fd:FormData){
+  const out:SerializedFormData=[]
+  for(const [key,value] of fd.entries()){
+    if(value instanceof File){ const buf=await value.arrayBuffer(); out.push({key, value:{name:value.name,type:value.type,data:buf}}) }
+    else out.push({key, value:String(value)})
+  }
+  return out
+}
+function deserializeFormData(sf:SerializedFormData){
+  const fd = new FormData()
+  for(const {key,value} of sf){
+    if(typeof value==='string') fd.append(key,value)
+    else fd.append(key, new File([value.data], value.name, {type:value.type}))
+  }
+  return fd
+}
+function uuid(){ return 'q_'+Math.random().toString(36).slice(2)+Date.now().toString(36) }
+
+const queue = {
+  async enqueueForm(kind:QueuedKind,url:string,fd:FormData){
+    const i:QueueItem={ id:uuid(), kind, url, method:'POST', contentType:'form', form:await serializeFormData(fd), createdAt:Date.now(), attempts:0 }
+    await idbq.put(i); return i.id
+  },
+  async enqueueJSON(kind:QueuedKind,url:string,json:any){
+    const i:QueueItem={ id:uuid(), kind, url, method:'POST', contentType:'json', json, headers:{'Content-Type':'application/json'}, createdAt:Date.now(), attempts:0 }
+    await idbq.put(i); return i.id
+  },
+  async flush(){
+    const xs=await idbq.all()
+    for(const i of xs){
+      try{
+        let body:BodyInit|null=null
+        let h:Record<string,string>|undefined=i.headers
+        if(i.contentType==='form'&&i.form) body=deserializeFormData(i.form)
+        else if(i.contentType==='json'){ body=JSON.stringify(i.json); h={...(h||{}),'Content-Type':'application/json'} }
+        const r=await fetch(i.url,{method:i.method,headers:h,body})
+        if(!r.ok) throw new Error('HTTP '+r.status)
+        await idbq.del(i.id)
+      }catch{/* keep in outbox */}
+    }
+  },
+  async flushUntilEmpty(maxMs:number=30000){
+    const start=Date.now(); let attempt=0
+    while(navigator.onLine){
+      await queue.flush()
+      const left=(await idbq.all()).length
+      if(left===0) return
+      attempt++
+      const delay=Math.min(500*(2**attempt), 4000)
+      await new Promise(r=>setTimeout(r, delay))
+      if(Date.now()-start>maxMs) break
+    }
+  },
+  start(){
+    // Flush on network regain immediately and keep trying for a short window
+    window.addEventListener('online', async ()=>{ toast('Back online. Syncing…','info'); await queue.flushUntilEmpty() })
+    // Try when the app/tab becomes visible again
+    document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible' && navigator.onLine){ queue.flushUntilEmpty() } })
+    // React to connection changes (if supported)
+    const anyNav:any = navigator as any
+    if(anyNav?.connection?.addEventListener){ anyNav.connection.addEventListener('change',()=>{ if(navigator.onLine) queue.flushUntilEmpty() }) }
+    // Safety interval as a fallback
+    setInterval(()=>{ if(navigator.onLine) queue.flush() }, 30000)
+    if(navigator.onLine) queue.flush()
+  }
+}
+queue.start()
+
+async function mirror(eventType:string,payload:any){
+  const evt={eventType,payload,ts:new Date().toISOString()}
+  if(USE_MOCK){ await queue.enqueueJSON('SYNC',`${BASE_URL}/api/tms/sync`,evt); return {queued:true} }
+  if(!navigator.onLine){ await queue.enqueueJSON('SYNC',`${BASE_URL}/api/tms/sync`,evt); return {queued:true} }
+  try{
+    const r=await fetch(`${BASE_URL}/api/tms/sync`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(evt)})
+    if(!r.ok) throw new Error('HTTP '+r.status)
+    return await r.json()
+  }catch{
+    await queue.enqueueJSON('SYNC',`${BASE_URL}/api/tms/sync`,evt)
+    return {queued:true}
+  }
+}
+
+// -------------------- MOCK + API --------------------
+const mock = {
+  token:'mock-token',
+  driver: { id:'drv_123', name:'Alex Driver', mc:'MC123456', dot:'DOT789012', phone:'+1 (555) 010-2233', email:'alex@example.com', isAdmin:true } as Driver,
+  users: [
+    { id:'u1', username:'admin', role:'admin', name:'Admin User', email:'admin@drayagepro.local' },
+    { id:'u2', username:'driver1', role:'driver', name:'Taylor Driver', email:'taylor@example.com' },
+    { id:'u3', username:'carrier1', role:'carrier', name:'Casey Carrier', email:'ops@carrier.com' },
+  ] as UserRow[],
+  loads: Array.from({length:12}).map((_,i)=>({
+    id:`L${1000+i}`,
+    ref:`DRP-${20250+i}`,
+    origin:['CIC – Chicago, IL','UP Global 4 – Joliet, IL','BNSF LPC – Elwood, IL','NS – 47th St, Chicago, IL'][i%4],
+    destination:['Walmart RDC – Beaver Dam, WI','Target DC – DeKalb, IL','Kohl’s DC – Ottawa, IL','Amazon DIL3 – Joliet, IL'][i%4],
+    pickup:new Date(Date.now()+i*21600000).toISOString(),
+    delivery:new Date(Date.now()+(i*21600000+108000000)).toISOString(),
+    equipment:['CHASSIS','DRY','REEFER','FLAT'][i%4] as Load['equipment'],
+    distanceMi:45+i*8,
+    rate:350+i*25,
+    accessorials:i%3?['Chassis Flip']:['Chassis Flip','Pre‑Pull'],
+    notes:i%2?'Appointment required at consignee':'Live unload 1 hr',
+    postedToNetwork:i%2===0,
+    thirdPartyRef:i%3===0?`3P-${9000+i}`:undefined,
+    referenceNumbers:i%2===0?[`REF-${i}`,`PO-${7000+i}`]:[`PO-${7000+i}`]
+  })) as Load[],
+  bids: [] as Bid[],
+  compliance: [
+    {id:'c1',type:'W9',status:'APPROVED'},
+    {id:'c2',type:'CARGO_INSURANCE',status:'PENDING',expiry:new Date(Date.now()+10368000000).toISOString()},
+    {id:'c3',type:'AUTO_INSURANCE',status:'APPROVED',expiry:new Date(Date.now()+17280000000).toISOString()},
+    {id:'c4',type:'CDL',status:'EXPIRED',expiry:new Date(Date.now()-864000000).toISOString()},
+    {id:'c5',type:'CARRIER_AGREEMENT',status:'PENDING'}
+  ] as ComplianceItem[],
+  messages: [ {id:'m1',from:'Dispatch',subject:'Welcome to DrayagePro',body:'Upload your COI to get approved fast.',ts:new Date().toISOString()} ] as Msg[]
+}
+
+const api = {
+  async login(phoneOrEmail:string,password:string){
+    if(USE_MOCK) return new Promise(res=>setTimeout(()=>res({token:mock.token,driver:mock.driver}),500))
+    const r=await fetch(`${BASE_URL}/api/driver/login`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phoneOrEmail,password})})
+    if(!r.ok) throw new Error('Login failed')
+    return r.json()
+  },
+  async loadboard(params:{posted?:boolean;region?:string;equipment?:string;radius?:number;q?:string}){
+    if(USE_MOCK){ const only=typeof params?.posted==='boolean'?params.posted:true; const loads=mock.loads.filter(l=>only?l.postedToNetwork:true); return new Promise(res=>setTimeout(()=>res({loads}),300)) }
+    const search=new URLSearchParams({...(params as any),posted:String(params?.posted??true)}).toString();
+    const r=await fetch(`${BASE_URL}/api/driver/loadboard?${search}`)
+    return r.json()
+  },
+  async placeBid(b:{loadId:string;amount:number;notes?:string;eta?:string;equipment?:Load['equipment']}){
+    if(USE_MOCK){ const bid:Bid={id:'B'+(1000+mock.bids.length),loadId:b.loadId,amount:b.amount,status:'PENDING',createdAt:new Date().toISOString(),notes:b.notes}; mock.bids.unshift(bid); return new Promise(res=>setTimeout(()=>res({bidId:bid.id,status:bid.status}),500)) }
+    const r=await fetch(`${BASE_URL}/api/driver/bid`,{method:'POST',body:JSON.stringify(b),headers:{'Content-Type':'application/json'}})
+    return r.json()
+  },
+  async myBids(){ if(USE_MOCK) return {bids:mock.bids}; const r=await fetch(`${BASE_URL}/api/driver/bids`); return r.json() },
+  async myLoads(status?:string){ if(USE_MOCK) return {loads:mock.loads.slice(0,3).map(l=>({...l,status:'ASSIGNED' as const}))}; const r=await fetch(`${BASE_URL}/api/driver/loads${status?`?status=${status}`:''}`); return r.json() },
+  async submitPOD(id:string,payload:FormData){
+    if(USE_MOCK) return new Promise(r=>setTimeout(()=>r({ok:true}),700))
+    if(!navigator.onLine){ await queue.enqueueForm('POD',`${BASE_URL}/api/driver/loads/${id}/pod`,payload); return {queued:true} }
+    try{ const r=await fetch(`${BASE_URL}/api/driver/loads/${id}/pod`,{method:'POST',body:payload}); if(!r.ok) throw new Error('HTTP '+r.status); return r.json() }
+    catch{ await queue.enqueueForm('POD',`${BASE_URL}/api/driver/loads/${id}/pod`,payload); return {queued:true} }
+  },
+  async compliance(){ if(USE_MOCK) return {items:mock.compliance}; const r=await fetch(`${BASE_URL}/api/driver/compliance`); return r.json() },
+  async uploadCompliance(fd:FormData){
+    if(USE_MOCK){ mock.compliance.push({id:'c'+(1+mock.compliance.length),type:'OTHER',status:'PENDING'}); return {ok:true} }
+    if(!navigator.onLine){ await queue.enqueueForm('COMPLIANCE',`${BASE_URL}/api/driver/compliance`,fd); return {queued:true} }
+    try{ const r=await fetch(`${BASE_URL}/api/driver/compliance`,{method:'POST',body:fd}); if(!r.ok) throw new Error('HTTP '+r.status); return r.json() }
+    catch{ await queue.enqueueForm('COMPLIANCE',`${BASE_URL}/api/driver/compliance`,fd); return {queued:true} }
+  },
+  async messages(){ if(USE_MOCK) return {messages:mock.messages}; const r=await fetch(`${BASE_URL}/api/driver/messages`); return r.json() },
+  async checkAuthority(params:{mc?:string;dot?:string}):Promise<{info:AuthorityInfo}>{
+    if(USE_MOCK){ const info:AuthorityInfo={ status:'ACTIVE',operatingStatus:'Authorized for Property',legalName:'Example Carrier LLC',dbaName:'Example Carrier',mcNumber:params.mc||'MC123456',dotNumber:params.dot||'DOT789012',entityType:'Carrier',authorityType:'Common',insuranceOnFile:true,boc3OnFile:true,outOfServiceDate:null,lastUpdated:new Date().toISOString(),saferUrl:'https://safer.fmcsa.dot.gov' }; return new Promise(res=>setTimeout(()=>res({info}),350)) }
+    const q=new URLSearchParams(params as any).toString(); const r=await fetch(`${BASE_URL}/api/driver/carrier/authority?${q}`); if(!r.ok) throw new Error('Authority lookup failed'); return r.json()
+  },
+  // ------- Admin API -------
+  async adminListUsers(){ if(USE_MOCK) return {users:mock.users}; const r=await fetch(`${BASE_URL}/api/admin/users`); return r.json() },
+  async adminCreateUser(u:{username:string;password:string;role:UserRow['role'];name?:string;email?:string;phone?:string}){
+    if(USE_MOCK){ const id='u'+(mock.users.length+1); mock.users.push({id,username:u.username,role:u.role,name:u.name,email:u.email,phone:u.phone}); return {ok:true,id} }
+    const r=await fetch(`${BASE_URL}/api/admin/users`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(u)}); return r.json()
+  },
+  async adminSetPassword(username:string,newPassword:string){ if(USE_MOCK) return {ok:true}; const r=await fetch(`${BASE_URL}/api/admin/users/${encodeURIComponent(username)}/password`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:newPassword})}); return r.json() },
+}
+
+// -------------------- TOASTS + OFFLINE BANNER --------------------
+type ToastItem={id:string;message:string;variant?:'success'|'info'|'warning'|'error'}
+const TOAST_EVENT='drp-toast'
+function toast(message:string,variant:ToastItem['variant']='info'){
+  window.dispatchEvent(new CustomEvent(TOAST_EVENT,{detail:{id:Math.random().toString(36).slice(2),message,variant}}))
+}
+function Toasts(){
+  const [items,setItems]=useState<ToastItem[]>([])
+  useEffect(()=>{ const on=(e:any)=>{ const t:ToastItem=e.detail; setItems(p=>[...p,t]); setTimeout(()=>setItems(p=>p.filter(x=>x.id!==t.id)),3200) }; window.addEventListener(TOAST_EVENT,on); return()=>window.removeEventListener(TOAST_EVENT,on)},[])
+  const tone=(v?:ToastItem['variant'])=>v==='success'?'bg-green-600':v==='warning'?'bg-amber-600':v==='error'?'bg-red-600':'bg-slate-700'
+  return (<div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[100] flex flex-col gap-2 w-[92%] max-w-md">{items.map(t=>(<div key={t.id} className={`text-white ${tone(t.variant)} rounded-xl shadow-lg px-4 py-3 text-sm`}>{t.message}</div>))}</div>)
+}
+function OfflineBanner(){ const online=useOnlineStatus(); if(online) return null; return(<div className="sticky top-0 z-50 w-full bg-amber-500 text-black text-sm px-3 py-2 rounded-b-xl flex items-center gap-2"><WifiOff className="w-4 h-4"/> Offline. Uploads will auto-send.</div>) }
+
+// -------------------- UI BASICS --------------------
+function Section({title,children,right}:{title:string;children:React.ReactNode;right?:React.ReactNode}){ return(<Card className="w-full shadow-sm"><CardHeader className="flex flex-row items-center justify-between gap-2"><CardTitle className="text-xl">{title}</CardTitle><div>{right}</div></CardHeader><CardContent>{children}</CardContent></Card>) }
+function Stat({label,value}:{label:string;value:React.ReactNode}){ return(<div className="p-4 rounded-2xl border bg-card flex flex-col gap-1 min-w-[160px]"><div className="text-xs text-muted-foreground">{label}</div><div className="text-lg font-semibold">{value}</div></div>) }
+
+// -------------------- SIGNATURE PAD --------------------
+function SignaturePad({onChange}:{onChange:(dataUrl:string|null)=>void}){
+  const ref=useRef<HTMLCanvasElement|null>(null)
+  const drawing=useRef(false as any)
+  useEffect(()=>{
+    const c=ref.current!; const ctx=c.getContext('2d')!; ctx.lineWidth=2; ctx.lineCap='round'; ctx.strokeStyle='#111'
+    const onDown=(e:MouseEvent|TouchEvent)=>{ drawing.current=true; const {x,y}=getPos(e,c); ctx.beginPath(); ctx.moveTo(x,y) }
+    const onMove=(e:MouseEvent|TouchEvent)=>{ if(!drawing.current) return; const {x,y}=getPos(e,c); ctx.lineTo(x,y); ctx.stroke(); onChange(c.toDataURL('image/png')) }
+    const onUp=()=>{ drawing.current=false; onChange(c.toDataURL('image/png')) }
+    c.addEventListener('mousedown',onDown as any); c.addEventListener('mousemove',onMove as any); window.addEventListener('mouseup',onUp)
+    c.addEventListener('touchstart',onDown as any,{passive:true} as any); c.addEventListener('touchmove',onMove as any,{passive:true} as any); window.addEventListener('touchend',onUp)
+    return()=>{ c.removeEventListener('mousedown',onDown as any); c.removeEventListener('mousemove',onMove as any); window.removeEventListener('mouseup',onUp); c.removeEventListener('touchstart',onDown as any); c.removeEventListener('touchmove',onMove as any); window.removeEventListener('touchend',onUp) }
+  },[])
+  const clear=()=>{ const c=ref.current!; const ctx=c.getContext('2d')!; ctx.clearRect(0,0,c.width,c.height); onChange(null) }
+  return (<div className="space-y-2"><canvas ref={ref} width={600} height={200} className="w-full border rounded-xl bg-white"/><div className="text-xs text-muted-foreground">Sign below.</div><Button type="button" variant="secondary" onClick={clear}>Clear</Button></div>)
+}
+function getPos(e:any,c:HTMLCanvasElement){ const r=c.getBoundingClientRect(); const x=(e.touches?e.touches[0].clientX:e.clientX)-r.left; const y=(e.touches?e.touches[0].clientY:e.clientY)-r.top; return{x,y} }
+
+// -------------------- LOGIN --------------------
+function LoginView({onLogin}:{onLogin:(token:string,driver:Driver)=>void}){
+  const [login,setLogin]=useState('')
+  const [password,setPassword]=useState('')
+  const [loading,setLoading]=useState(false)
+  const [err,setErr]=useState<string|undefined>()
+  const doLogin=async()=>{
+    setLoading(true); setErr(undefined)
+    try{ const {token,driver}=await api.login(login,password) as any; storage.set('drp.driver',driver); storage.set('drp.token',token); onLogin(token as string,driver as Driver) }
+    catch(e:any){ setErr(e?.message||'Login failed') }
+    finally{ setLoading(false) }
+  }
+  return (
+    <div className="max-w-md mx-auto">
+      <Section title="Driver Login" right={<LogIn className="w-5 h-5"/>}>
+        <div className="space-y-4">
+          <div className="space-y-2"><Label>Phone or Email</Label><Input placeholder="+1 555 123 4567 or you@example.com" value={login} onChange={e=>setLogin(e.target.value)}/></div>
+          <div className="space-y-2"><Label>Password</Label><Input type="password" placeholder="••••••••" value={password} onChange={e=>setPassword(e.target.value)}/></div>
+          {err&&<div className="text-sm text-red-600">{err}</div>}
+          <Button onClick={doLogin} disabled={loading} className="w-full min-h-[44px]">{loading?<Loader2 className="w-4 h-4 mr-2 animate-spin"/>:<LogIn className="w-4 h-4 mr-2"/>}Sign In</Button>
+        </div>
+      </Section>
+    </div>
+  )
+}
+
+// -------------------- LOADBOARD --------------------
+function LB({onBid}:{onBid:(load:Load)=>void}){
+  const [loading,setLoading]=useState(true)
+  const [loads,setLoads]=useState<Load[]>([])
+  const [q,setQ]=useState('')
+  const [equipment,setEquipment]=useState<string|undefined>()
+
+  useEffect(()=>{
+    let ok=true
+    ;(async()=>{ setLoading(true); const {loads}=await api.loadboard({equipment,posted:true}) as any; if(ok){ setLoads(loads as Load[]); setLoading(false) } })()
+    return()=>{ ok=false }
+  },[equipment])
+
+  useEffect(()=>{
+    let ws:WebSocket|null=null
+    try{ ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/api/driver/ws') }catch{}
+    if(!ws) return
+    ws.onmessage=(msg)=>{
+      try{
+        const evt=JSON.parse(msg.data)
+        if(evt?.type==='load_unposted'&&evt.loadId){ setLoads(p=>p.filter(l=>l.id!==evt.loadId)); toast('Our apologies, this load is no longer posted for bidding','warning') }
+        if(evt?.type==='load_posted'||evt?.type==='load_update'){
+          setLoading(true); api.loadboard({equipment,posted:true}).then(({loads}:any)=>{ setLoads(loads as Load[]); setLoading(false) })
+        }
+      }catch{}
+    }
+    return()=>{ try{ ws&&ws.close() }catch{} }
+  },[equipment])
+
+  const F=(l:Load)=>{
+    const t=`${l.ref} ${l.origin} ${l.destination} ${l.notes??''}`.toLowerCase()
+    return t.includes(q.toLowerCase())&&(!equipment||l.equipment===equipment)
+  }
+
+  return (
+    <Section title="Live Loadboard" right={<Filter className="w-5 h-5"/>}>
+      <div className="flex flex-col sm:flex-row gap-3 mb-3">
+        <div className="flex-1 flex items-center gap-2"><Search className="w-4 h-4"/><Input placeholder="Search ref, origin, destination" value={q} onChange={e=>setQ(e.target.value)}/></div>
+        <Select onValueChange={setEquipment}>
+          <SelectTrigger className="w-full sm:w-[200px]"><SelectValue placeholder="Equipment"/></SelectTrigger>
+          <SelectContent>{['CHASSIS','DRY','REEFER','FLAT'].map(x=>(<SelectItem key={x} value={x}>{x==='DRY'?'Dry Van':x==='FLAT'?'Flatbed':x==='REEFER'?'Reefer':'Chassis'}</SelectItem>))}</SelectContent>
+        </Select>
+      </div>
+
+      {loading ? (
+        <div className="py-8 flex items-center justify-center text-muted-foreground"><Loader2 className="w-5 h-5 mr-2 animate-spin"/> Loading…</div>
+      ) : (
+        <div className="space-y-3">
+          {loads.filter(F).map(l=>(
+            <div key={l.id} className="p-4 rounded-2xl border bg-card space-y-1">
+              <div className="flex items-center justify-between"><div className="font-semibold">{l.ref}</div><Badge>Network</Badge></div>
+              <div className="flex items-center gap-2 text-sm"><MapPin className="w-4 h-4"/> {l.origin} <span className="text-muted-foreground">→</span> {l.destination}</div>
+              <div className="text-xs text-muted-foreground">Pick: {fmt.dt(l.pickup)} • Del: {fmt.dt(l.delivery)}</div>
+              {l.accessorials?.length? <div className="text-xs text-muted-foreground">{l.accessorials.join(' • ')}</div> : null}
+              {(l.thirdPartyRef||l.referenceNumbers?.length)&&(
+                <div className="text-[11px] text-muted-foreground">
+                  {l.thirdPartyRef && (<span>3P: {l.thirdPartyRef}</span>)}
+                  {l.thirdPartyRef && l.referenceNumbers?.length ? ' • ' : ''}
+                  {l.referenceNumbers?.length ? `Refs: ${l.referenceNumbers.join(', ')}` : ''}
+                </div>
+              )}
+              <div className="flex items-center justify-between pt-2">
+                <div className="text;base font-semibold">{fmt.money(l.rate)}</div>
+                <Button size="sm" className="min-h-[44px]" onClick={()=>onBid(l)}>Bid</Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </Section>
+  )
+}
+
+function BidDrawer({load,onClose,onPlaced}:{load:Load|null;onClose:()=>void;onPlaced:()=>void}){
+  const [amount,setAmount]=useState('')
+  const [eta,setEta]=useState('')
+  const [notes,setNotes]=useState('')
+  const [agree,setAgree]=useState(false)
+  const [submitting,setSubmitting]=useState(false)
+  useEffect(()=>{ if(load) setAmount(String(load.rate??'')) },[load])
+  if(!load) return null
+  const submit=async()=>{
+    setSubmitting(true)
+    await api.placeBid({loadId:load.id,amount:Number(amount||0),notes,eta,equipment:load.equipment})
+    await mirror('bid_placed',{loadId:load.id,amount:Number(amount||0),notes,eta,equipment:load.equipment})
+    setSubmitting(false)
+    onPlaced(); onClose()
+  }
+  return (
+    <div className="fixed inset-0 bg-black/40 z-40" onClick={onClose}>
+      <div className="absolute right-0 top-0 h-full w-full sm:w-[440px] bg-background shadow-xl p-6 overflow-y-auto" onClick={e=>e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-4"><div className="text-lg font-semibold">Place Bid – {load.ref}</div><Button variant="ghost" onClick={onClose}>Close</Button></div>
+        <div className="space-y-4">
+          <div className="text-sm text-muted-foreground">{load.origin} → {load.destination}</div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div><Label>Bid (USD)</Label><Input inputMode="numeric" type="number" value={amount} onChange={e=>setAmount(e.target.value)}/></div>
+            <div><Label>ETA</Label><Input type="datetime-local" value={eta} onChange={e=>setEta(e.target.value)}/></div>
+          </div>
+          <div><Label>Notes</Label><Textarea rows={3} value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Accessorials, fees…"/></div>
+          <div className="flex items-center gap-3"><Switch checked={agree} onCheckedChange={setAgree}/><Label className="text-sm">I agree to terms</Label></div>
+          <Button disabled={!agree||submitting} onClick={submit} className="w-full min-h-[44px]">{submitting?<Loader2 className="w-4 h-4 mr-2 animate-spin"/>:<ClipboardList className="w-4 h-4 mr-2"/>}Submit Bid</Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// -------------------- BIDS --------------------
+function Bids(){
+  const [bids,setBids]=useState<Bid[]>([])
+  useEffect(()=>{ (async()=>{ const {bids}=await api.myBids(); setBids(bids as Bid[]) })() },[])
+  return (<Section title="My Bids" right={<FileText className="w-5 h-5"/>}>
+    <div className="space-y-3">{bids.map(b=>(
+      <div key={b.id} className="p-4 rounded-2xl border">
+        <div className="flex items-center justify-between"><div className="font-semibold">{b.id}</div><Badge variant={b.status==='ACCEPTED'?'default':b.status==='PENDING'?'secondary':'destructive'}>{b.status}</Badge></div>
+        <div className="text-sm">Load: {b.loadId}</div>
+        <div className="text-sm">Amount: {fmt.money(b.amount)}</div>
+        <div className="text-xs text-muted-foreground">Placed: {fmt.dt(b.createdAt)}</div>
+      </div>
+    ))}</div>
+  </Section>)
+}
+
+// -------------------- LOADS + POD --------------------
+function LoadsV(){
+  const [loads,setLoads]=useState<DriverLoad[]>([])
+  const [podFor,setPodFor]=useState<DriverLoad|null>(null)
+  useEffect(()=>{ (async()=>{ const {loads}=await api.myLoads('assigned') as any; setLoads(loads as DriverLoad[]) })() },[])
+  return (
+    <Section title="Assigned & Active Loads" right={<Truck className="w-5 h-5"/>}>
+      <div className="space-y-3">{loads.map(l=>(
+        <div key={l.id} className="p-4 rounded-2xl border">
+          <div className="flex items-center justify-between"><div className="font-semibold">{l.ref}</div><Badge>{l.status}</Badge></div>
+          <div className="text-sm">{l.origin} → {l.destination}</div>
+          <div className="text-xs text-muted-foreground">Pick: {fmt.dt(l.pickup)} • Del: {fmt.dt(l.delivery)}</div>
+          <div className="pt-2"><Button size="sm" className="min-h-[44px]" variant={l.podSubmitted?'secondary':'default'} onClick={()=>setPodFor(l)}>{l.podSubmitted?<Check className="w-4 h-4 mr-2"/>:<UploadCloud className="w-4 h-4 mr-2"/>}{l.podSubmitted?'Resubmit POD':'Submit POD'}</Button></div>
+        </div>
+      ))}</div>
+      <PODModal load={podFor} onClose={()=>setPodFor(null)} onSubmitted={()=>{}}/>
+    </Section>
+  )
+}
+function PODModal({load,onClose,onSubmitted}:{load:DriverLoad|null;onClose:()=>void;onSubmitted:()=>void}){
+  const [files,setFiles]=useState<File[]>([])
+  const [consignee,setConsignee]=useState('')
+  const [deliveredAt,setDeliveredAt]=useState('')
+  const [notes,setNotes]=useState('')
+  const [sig,setSig]=useState<string|null>(null)
+  const [submitting,setSubmitting]=useState(false)
+  if(!load) return null
+  const onFile=(e:React.ChangeEvent<HTMLInputElement>)=>{ if(e.target.files) setFiles(Array.from(e.target.files)) }
+  const submit=async()=>{
+    const fd=new FormData()
+    files.forEach(f=>fd.append('files',f))
+    fd.append('deliveredAt',deliveredAt)
+    fd.append('consignee',consignee)
+    fd.append('notes',notes)
+    if(sig) fd.append('signaturePNG',sig)
+    setSubmitting(true)
+    const res:any=await api.submitPOD(load.id,fd)
+    setSubmitting(false)
+    if(res?.queued) toast('Offline. POD queued.','info'); else toast('POD uploaded.','success')
+    await mirror('pod_submitted',{loadId:load.id,deliveredAt,consignee,notes,files:files.map(f=>f.name),signature:!!sig,queued:!!res?.queued})
+    onSubmitted(); onClose()
+  }
+  return (
+    <div className="fixed inset-0 bg-black/40 z-40" onClick={onClose}>
+      <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-3xl bg-background rounded-2xl shadow-xl p-6" onClick={e=>e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-4"><div className="text-lg font-semibold">Submit POD – {load.ref}</div><Button variant="ghost" onClick={onClose}>Close</Button></div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="space-y-3">
+            <div><Label>Delivered At</Label><Input type="datetime-local" value={deliveredAt} onChange={e=>setDeliveredAt(e.target.value)}/></div>
+            <div><Label>Consignee</Label><Input value={consignee} onChange={e=>setConsignee(e.target.value)} placeholder="Name"/></div>
+            <div><Label>Notes</Label><Textarea rows={3} value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Damages, exceptions, etc."/></div>
+            <div><Label>POD Files (PDF/JPG/PNG)</Label><Input type="file" multiple accept=".pdf,image/*" capture="environment" onChange={onFile}/></div>
+          </div>
+          <div className="space-y-3">
+            <Label>Signature</Label>
+            <SignaturePad onChange={setSig}/>
+            <div className="text-xs text-muted-foreground">Signature captured as PNG.</div>
+          </div>
+        </div>
+        <div className="mt-4"><Button className="w-full min-h-[44px]" onClick={submit} disabled={submitting||!files.length||!consignee||!deliveredAt}>{submitting?<Loader2 className="w-4 h-4 mr-2 animate-spin"/>:<CloudUpload className="w-4 h-4 mr-2"/>}Submit POD</Button></div>
+      </div>
+    </div>
+  )
+}
+
+// -------------------- COMPLIANCE --------------------
+function Comp(){
+  const [items,setItems]=useState<ComplianceItem[]>([])
+  const [file,setFile]=useState<File|null>(null)
+  const [type,setType]=useState<ComplianceItem['type']>('COI')
+  const [expiry,setExpiry]=useState('')
+  useEffect(()=>{ (async()=>{ const {items}=await api.compliance() as any; setItems(items as ComplianceItem[]) })() },[])
+  const upload=async()=>{
+    const fd=new FormData()
+    if(file) fd.append('file',file)
+    fd.append('type',type)
+    if(expiry) fd.append('expiry',expiry)
+    const res:any=await api.uploadCompliance(fd)
+    const {items}=await api.compliance() as any
+    setItems(items as ComplianceItem[])
+    setFile(null)
+    if(res?.queued) toast('Offline. Doc queued.','info'); else toast('Document uploaded.','success')
+    await mirror('compliance_uploaded',{type,expiry:expiry||null,fileName:file?.name||null,queued:!!res?.queued})
+  }
+  const pill=(s:ComplianceItem['status'])=> s==='APPROVED'?'default':s==='PENDING'?'secondary':s==='EXPIRED'?'destructive':'outline'
+  const label=(t:ComplianceItem['type'])=> t==='CARGO_INSURANCE'?'Cargo Insurance':t==='AUTO_INSURANCE'?'Auto Insurance':t==='CARRIER_AGREEMENT'?'Carrier Agreement':t
+  return (
+    <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+      <div className="xl:col-span-2">
+        <Section title="Compliance Status" right={<ShieldCheck className="w-5 h-5"/>}>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {items.map(i=>(
+              <div key={i.id} className="p-4 rounded-2xl border flex items-center justify_between md:justify-between">
+                <div>
+                  <div className="font-medium">{label(i.type)}</div>
+                  <div className="text-xs text-muted-foreground">{i.expiry?`Expires ${fmt.d(i.expiry)}`:'No expiry on file'}</div>
+                </div>
+                <Badge variant={pill(i.status)}>{i.status}</Badge>
+              </div>
+            ))}
+          </div>
+        </Section>
+      </div>
+      <div>
+        <Section title="Upload Document" right={<UploadCloud className="w-5 h-5"/>}>
+          <div className="space-y-3">
+            <div><Label>Type</Label>
+              <Select value={type} onValueChange={(v:any)=>setType(v)}>
+                <SelectTrigger className="min-h-[44px]"><SelectValue/></SelectTrigger>
+                <SelectContent>{['W9','COI','CDL','MC_AUTH','DOT_LETTER','CARGO_INSURANCE','AUTO_INSURANCE','CARRIER_AGREEMENT','OTHER'].map(t=>(<SelectItem key={t} value={t}>{label(t as any)}</SelectItem>))}</SelectContent>
+              </Select>
+            </div>
+            <div><Label>Expiry</Label><Input type="date" value={expiry} onChange={e=>setExpiry(e.target.value)}/></div>
+            <div><Label>File</Label><Input className="min-h-[44px]" type="file" accept=".pdf,image/*" capture="environment" onChange={e=>setFile(e.target.files?.[0]||null)}/></div>
+            <Button className="min-h-[44px]" onClick={upload} disabled={!file}>Upload</Button>
+          </div>
+        </Section>
+      </div>
+    </div>
+  )
+}
+
+// -------------------- OUTBOX --------------------
+function Outbox(){
+  const [pending,setPending]=useState<QueueItem[]>([])
+  const refresh=async()=>setPending(await idbq.all())
+  useEffect(()=>{ refresh(); const i=setInterval(refresh,5000); return()=>clearInterval(i) },[])
+  const flushNow=async()=>{ await queue.flushUntilEmpty(); await refresh(); const left=(await idbq.all()).length; toast(left===0?'Outbox empty.':'Retrying…', left===0?'info':'warning') }
+  const remove=async(id:string)=>{ await idbq.del(id); await refresh(); toast('Removed.','warning') }
+  const flushItem=async(id:string)=>{
+    const items=await idbq.all(); const it=items.find(x=>x.id===id); if(!it) return
+    try{
+      let body:BodyInit|null=null; let headers:Record<string,string>|undefined=it.headers
+      if(it.contentType==='form'&&it.form) body=deserializeFormData(it.form)
+      else if(it.contentType==='json'){ body=JSON.stringify(it.json); headers={...(headers||{}),'Content-Type':'application/json'} }
+      const res=await fetch(it.url,{method:it.method,headers,body})
+      if(!res.ok) throw new Error('HTTP '+res.status)
+      await idbq.del(it.id); await refresh(); toast('Upload sent','success')
+    }catch{ toast('Retry failed.','warning') }
+  }
+  return (
+    <Section title="Outbox" right={<UploadCloud className="w-5 h-5"/>}>
+      <div className="flex items-center gap-2 mb-3">
+        <Button size="sm" className="min-h-[44px]" onClick={flushNow}>Retry All</Button>
+        <Button size="sm" className="min-h-[44px]" variant="secondary" onClick={refresh}>Refresh</Button>
+      </div>
+      <div className="space-y-3">
+        {pending.map(p=>(
+          <div key={p.id} className="p-4 rounded-2xl border">
+            <div className="text-sm">Type: <Badge variant="secondary">{p.kind}</Badge></div>
+            <div className="text-xs break-all">{p.url}</div>
+            <div className="text-xs text-muted-foreground">Queued: {new Date(p.createdAt).toLocaleString()}</div>
+            <div className="flex gap-2 pt-2">
+              <Button size="sm" className="min-h-[44px]" onClick={()=>flushItem(p.id)}>Send</Button>
+              <Button size="sm" className="min-h-[44px]" variant="secondary" onClick={()=>remove(p.id)}>Remove</Button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </Section>
+  )
+}
+
+// -------------------- MESSAGES --------------------
+function Msgs(){
+  const [messages,setMessages]=useState<Msg[]>([])
+  useEffect(()=>{ (async()=>{ const {messages}=await api.messages() as any; setMessages(messages as Msg[]) })() },[])
+  return (<Section title="Messages" right={<MessageCircle className="w-5 h-5"/>}>
+    {messages.length===0? (
+      <div className="text-sm text-muted-foreground">No messages.</div>
+    ) : (
+      <div className="space-y-3">{messages.map(m=>(
+        <div key={m.id} className="p-4 rounded-2xl border">
+          <div className="text-xs text-muted-foreground">{m.from} • {fmt.dt(m.ts)}</div>
+          <div className="font-medium">{m.subject}</div>
+          <div className="text-sm">{m.body}</div>
+        </div>
+      ))}</div>
+    )}
+  </Section>)
+}
+
+// -------------------- ADMIN --------------------
+function Admin(){
+  const [users,setUsers]=useState<UserRow[]>([])
+  const [loading,setLoading]=useState(true)
+  const [creating,setCreating]=useState(false)
+  const [nu,setNu]=useState<{username:string;password:string;role:UserRow['role'];name?:string;email?:string;phone?:string}>({username:'',password:'',role:'driver'})
+  const [pw,setPw]=useState<Record<string,string>>({})
+
+  const load=async()=>{ setLoading(true); const {users}=await api.adminListUsers(); setUsers(users as UserRow[]); setLoading(false) }
+  useEffect(()=>{ load() },[])
+
+  const create=async()=>{
+    if(!nu.username||!nu.password){ toast('Username & password required','warning'); return }
+    setCreating(true)
+    const res=await api.adminCreateUser(nu)
+    setCreating(false)
+    if((res as any)?.ok){ toast('User created','success'); setNu({username:'',password:'',role:'driver'} as any); load(); await mirror('admin_user_created',nu) } else { toast('Create failed','error') }
+  }
+  const setPassword=async(username:string)=>{
+    const newPassword=pw[username]
+    if(!newPassword){ toast('Enter a new password first','warning'); return }
+    const res=await api.adminSetPassword(username,newPassword)
+    if((res as any)?.ok){ toast('Password changed','success'); setPw(s=>({...s,[username]:''})); await mirror('admin_password_changed',{username}) } else { toast('Change failed','error') }
+  }
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div className="lg:col-span-2">
+        <Section title="Users" right={<User className="w-5 h-5"/>}>
+          {loading? (
+            <div className="py-8 flex items-center justify-center text-muted-foreground"><Loader2 className="w-5 h-5 mr-2 animate-spin"/> Loading…</div>
+          ):(
+            <div className="space-y-3">
+              {users.map(u=>(
+                <div key={u.id} className="p-4 rounded-2xl border">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="font-semibold">{u.username}</div>
+                      <div className="text-xs text-muted-foreground">{u.role} • {u.email||'no email'} • {u.name||'—'}</div>
+                    </div>
+                    <Badge variant={u.role==='admin'?'default':'secondary'}>{u.role}</Badge>
+                  </div>
+                  <div className="mt-3 flex flex-col sm:flex-row gap-2">
+                    <Input placeholder="New password" type="password" value={pw[u.username]||''} onChange={e=>setPw(s=>({...s,[u.username]:e.target.value}))} className="min-h-[44px]"/>
+                    <Button onClick={()=>setPassword(u.username)} className="min-h-[44px]">Change Password</Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Section>
+      </div>
+      <div>
+        <Section title="Create Account" right={<ShieldCheck className="w-5 h-5"/>}>
+          <div className="space-y-3">
+            <div><Label>Username</Label><Input value={nu.username} onChange={e=>setNu(s=>({...s,username:e.target.value}))} className="min-h-[44px]"/></div>
+            <div><Label>Password</Label><Input type="password" value={nu.password} onChange={e=>setNu(s=>({...s,password:e.target.value}))} className="min-h-[44px]"/></div>
+            <div><Label>Role</Label>
+              <Select value={nu.role} onValueChange={(v:any)=>setNu(s=>({...s,role:v}))}>
+                <SelectTrigger className="min-h-[44px]"><SelectValue/></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="driver">driver</SelectItem>
+                  <SelectItem value="carrier">carrier</SelectItem>
+                  <SelectItem value="admin">admin</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div><Label>Name</Label><Input value={nu.name||''} onChange={e=>setNu(s=>({...s,name:e.target.value}))} className="min-h-[44px]"/></div>
+            <div><Label>Email</Label><Input type="email" value={nu.email||''} onChange={e=>setNu(s=>({...s,email:e.target.value}))} className="min-h-[44px]"/></div>
+            <div><Label>Phone</Label><Input value={nu.phone||''} onChange={e=>setNu(s=>({...s,phone:e.target.value}))} className="min-h-[44px]"/></div>
+            <Button onClick={create} disabled={creating} className="w-full min-h-[44px]">{creating?<Loader2 className="w-4 h-4 mr-2 animate-spin"/>:'Create'}</Button>
+          </div>
+        </Section>
+      </div>
+    </div>
+  )
+}
+
+// -------------------- PROFILE + FMCSA --------------------
+function Profile({driver}:{driver:Driver}){
+  const [auth,setAuth]=useState<AuthorityInfo|undefined>()
+  const [loading,setLoading]=useState(false)
+  const [err,setErr]=useState<string|undefined>()
+  const run=async()=>{
+    setErr(undefined); setLoading(true)
+    try{
+      const params:{mc?:string;dot?:string}={}
+      if(driver.mc) params.mc=driver.mc; if(driver.dot) params.dot=driver.dot
+      const {info}=await api.checkAuthority(params)
+      setAuth(info)
+      await mirror('authority_checked',{mc:params.mc||null,dot:params.dot||null,status:info.status,operatingStatus:info.operatingStatus||null,mcNumber:info.mcNumber||null,dotNumber:info.dotNumber||null,lastUpdated:info.lastUpdated||null})
+      toast('Authority checked','success')
+    }catch(e:any){ setErr(e?.message||'Lookup failed'); toast('Lookup failed','error') }
+    finally{ setLoading(false) }
+  }
+  return (
+    <Section title="Driver Profile" right={<User className="w-5 h-5"/>}>
+      <div className="grid grid-cols-2 gap-3 max-w-2xl">
+        <Stat label="Name" value={driver.name}/>
+        <Stat label="Phone" value={driver.phone||'—'}/>
+        <Stat label="Email" value={driver.email||'—'}/>
+        <Stat label="MC#" value={driver.mc||'—'}/>
+        <Stat label="DOT#" value={driver.dot||'—'}/>
+      </div>
+      <div className="mt-4 flex items-center gap-2">
+        <Button size="sm" className="min-h-[44px]" onClick={run} disabled={loading}>{loading?<Loader2 className="w-4 h-4 mr-2 animate-spin"/>:<ShieldCheck className="w-4 h-4 mr-2"/>}Check Operating Authority</Button>
+        {err&&<div className="text-xs text-red-600">{err}</div>}
+      </div>
+      {auth&&(
+        <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="p-4 rounded-2xl border"><div className="text-sm text-muted-foreground">Status</div><div className="font-semibold">{auth.status} {auth.operatingStatus?`• ${auth.operatingStatus}`:''}</div>{auth.outOfServiceDate&&<div className="text-xs text-muted-foreground">OOS: {fmt.d(auth.outOfServiceDate)}</div>}</div>
+          <div className="p-4 rounded-2xl border"><div className="text-sm text-muted-foreground">Carrier</div><div className="font-semibold">{auth.legalName||'—'}</div><div className="text-xs text-muted-foreground">DBA: {auth.dbaName||'—'}</div></div>
+          <div className="p-4 rounded-2xl border"><div className="text-sm text-muted-foreground">Numbers</div><div className="text-sm">MC: {auth.mcNumber||driver.mc||'—'}</div><div className="text-sm">DOT: {auth.dotNumber||driver.dot||'—'}</div></div>
+          <div className="p-4 rounded-2xl border"><div className="text-sm text-muted-foreground">Compliance</div><div className="text-sm">Insurance on file: {auth.insuranceOnFile?'Yes':'No'}</div><div className="text-sm">BOC‑3 on file: {auth.boc3OnFile?'Yes':'No'}</div><div className="text-xs text-muted-foreground">Updated: {fmt.dt(auth.lastUpdated)}</div></div>
+          {auth.saferUrl&&(<div className="p-4 rounded-2xl border md:col-span-2"><a className="text-sm underline" href={auth.saferUrl} target="_blank" rel="noreferrer">View on SAFER</a></div>)}
+        </div>
+      )}
+    </Section>
+  )
+}
+
+// -------------------- APP --------------------
+export default function App(){
+  const [token,setToken]=useState<string|undefined>(()=>storage.get('drp.token',undefined as any))
+  const [driver,setDriver]=useState<Driver|undefined>(()=>storage.get('drp.driver',undefined as any))
+  const [bidFor,setBidFor]=useState<Load|null>(null)
+  const onLogin=(t:string,d:Driver)=>{ setToken(t); setDriver(d); toast('Signed in','success') }
+  const onLogout=()=>{ storage.del('drp.token'); storage.del('drp.driver'); setToken(undefined); setDriver(undefined) }
+
+  if(!token||!driver){
+    return (
+      <SA>
+        <div className="p-4 max-w-6xl mx-auto">
+          <Toasts/>
+          <OfflineBanner/>
+          <LoginView onLogin={onLogin}/>
+        </div>
+      </SA>
+    )
+  }
+
+  return (
+    <SA>
+      <div className="p-4 max-w-6xl mx-auto">
+        <Toasts/>
+        <OfflineBanner/>
+
+        <div className="mb-3 flex items-center justify-between">
+          <div className="text-2xl font-semibold">DrayagePro Driver</div>
+          <div className="flex items-center gap-2">
+            <div className="text-sm text-muted-foreground">{driver.name}{driver.isAdmin?' • Admin':''}</div>
+            <Button size="sm" className="min-h-[40px]" variant="secondary" onClick={onLogout}>Sign out</Button>
+          </div>
+        </div>
+
+        <Tabs defaultValue="loadboard">
+          <TabsList className="flex flex-wrap">
+            <TabsTrigger value="loadboard">Loadboard</TabsTrigger>
+            <TabsTrigger value="bids">My Bids</TabsTrigger>
+            <TabsTrigger value="loads">My Loads</TabsTrigger>
+            <TabsTrigger value="compliance">Compliance</TabsTrigger>
+            <TabsTrigger value="messages">Messages</TabsTrigger>
+            <TabsTrigger value="outbox">Outbox</TabsTrigger>
+            <TabsTrigger value="profile">Profile</TabsTrigger>
+            {driver.isAdmin && <TabsTrigger value="admin">Admin</TabsTrigger>}
+          </TabsList>
+
+          <TabsContent value="loadboard"><LB onBid={setBidFor}/></TabsContent>
+          <TabsContent value="bids"><Bids/></TabsContent>
+          <TabsContent value="loads"><LoadsV/></TabsContent>
+          <TabsContent value="compliance"><Comp/></TabsContent>
+          <TabsContent value="messages"><Msgs/></TabsContent>
+          <TabsContent value="outbox"><Outbox/></TabsContent>
+          <TabsContent value="profile"><Profile driver={driver}/></TabsContent>
+          {driver.isAdmin && <TabsContent value="admin"><Admin/></TabsContent>}
+        </Tabs>
+
+        <BidDrawer load={bidFor} onClose={()=>setBidFor(null)} onPlaced={()=>toast('Bid submitted','success')}/>
+      </div>
+    </SA>
+  )
+}
+
+// -------------------- DEV TESTS (non-invasive) --------------------
+if ((import.meta as any)?.env?.MODE === 'development'){
+  try{
+    console.assert(fmt.money(1000)==='$1,000','money should format thousands')
+    console.assert(fmt.d('2020-01-01T00:00:00Z').length>3,'date formatter should return string')
+    const a=uuid(), b=uuid(); console.assert(a!==b && a.length>3 && b.length>3,'uuid should be unique-ish')
+    // Admin mocks
+    console.assert(Array.isArray((mock as any).users) && (mock as any).users.length>=1,'admin mock users list should exist')
+    // Label mapping tests
+    const testLabel = (t:ComplianceItem['type'], exp:string)=>{ const label=(x:ComplianceItem['type'])=> x==='CARGO_INSURANCE'?'Cargo Insurance':x==='AUTO_INSURANCE'?'Auto Insurance':x==='CARRIER_AGREEMENT'?'Carrier Agreement':x; console.assert(label(t)===exp,`label(${t}) should be ${exp}`) }
+    testLabel('CARGO_INSURANCE','Cargo Insurance')
+    testLabel('AUTO_INSURANCE','Auto Insurance')
+    testLabel('CARRIER_AGREEMENT','Carrier Agreement')
+    // Admin create mock test
+    ;(async()=>{ const res:any = await api.adminCreateUser({username:'_t_'+Math.random().toString(36).slice(2,7), password:'x', role:'driver'}); console.assert(res?.ok && typeof res.id==='string','adminCreateUser should return ok + id') })()
+  }catch{/* ignore */}
+}
